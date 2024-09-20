@@ -2,9 +2,12 @@ use std::env;
 use std::fs;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use cairo_lang_runner::profiling::ProfilingInfoProcessor;
 use cairo_lang_runner::short_string::as_cairo_short_string;
+use cairo_lang_runner::ProfilingInfoCollectionConfig;
 use cairo_lang_runner::{RunResultStarknet, RunResultValue, SierraCasmRunner, StarknetState};
 use cairo_lang_sierra::ids::FunctionId;
+use cairo_lang_sierra::program::StatementIdx;
 use cairo_lang_sierra::program::{Function, ProgramArtifact, VersionedProgram};
 use camino::Utf8PathBuf;
 use clap::Parser;
@@ -64,6 +67,10 @@ struct Args {
     /// It specified, `[ARGUMENTS]` CLI parameter will be ignored.
     #[arg(long)]
     arguments_file: Option<Utf8PathBuf>,
+
+    /// Whether to run the profiler.
+    #[arg(long, default_value_t = false)]
+    run_profiler: bool,
 }
 
 fn main() -> Result<()> {
@@ -134,7 +141,11 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             Some(Default::default())
         },
         Default::default(),
-        None,
+        if args.run_profiler {
+            Some(ProfilingInfoCollectionConfig::default())
+        } else {
+            None
+        },
     )?;
 
     let result = runner
@@ -145,6 +156,33 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             StarknetState::default(),
         )
         .with_context(|| "failed to run the function")?;
+
+    if args.run_profiler {
+        ensure!(
+            sierra_program.debug_info.is_some(),
+            formatdoc! {r#"
+                sierra program artifacts do not contain debug info
+            "#}
+        );
+
+        let statements_functions = sierra_program
+            .debug_info
+            .unwrap()
+            .user_func_names
+            .iter()
+            .map(|(k, v)| (StatementIdx(k.id as usize), v.to_string()))
+            .collect();
+
+        let profiling_info_processor =
+            ProfilingInfoProcessor::new(None, sierra_program.program, statements_functions);
+        match &result.profiling_info {
+            Some(raw_profiling_info) => {
+                let profiling_info = profiling_info_processor.process(&raw_profiling_info);
+                println!("Profiling info:\n{}", profiling_info);
+            }
+            None => println!("Warning: Profiling info not found."),
+        }
+    }
 
     ui.print(Summary {
         result,
