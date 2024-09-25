@@ -2,17 +2,15 @@ use std::env;
 use std::fs;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use cairo_lang_runner::profiling::ProfilingInfoProcessor;
-use cairo_lang_runner::profiling::ProfilingInfoProcessorParams;
 use cairo_lang_runner::short_string::as_cairo_short_string;
 use cairo_lang_runner::ProfilingInfoCollectionConfig;
 use cairo_lang_runner::{RunResultStarknet, RunResultValue, SierraCasmRunner, StarknetState};
 use cairo_lang_sierra::ids::FunctionId;
-use cairo_lang_sierra::program::StatementIdx;
 use cairo_lang_sierra::program::{Function, ProgramArtifact, VersionedProgram};
 use camino::Utf8PathBuf;
 use clap::Parser;
 use indoc::formatdoc;
+use profiling::save_profiler_output;
 use serde::Serializer;
 
 use scarb_metadata::{
@@ -23,6 +21,7 @@ use scarb_ui::components::Status;
 use scarb_ui::{Message, OutputFormat, Ui};
 
 mod deserialization;
+mod profiling;
 
 const EXECUTABLE_NAME: &str = "main";
 const DEFAULT_MAIN_FUNCTION: &str = "::main";
@@ -69,9 +68,12 @@ struct Args {
     #[arg(long)]
     arguments_file: Option<Utf8PathBuf>,
 
-    /// Whether to run the profiler.
-    #[arg(long, default_value_t = false)]
-    run_profiler: bool,
+    /// Path to the profiler output.
+    ///
+    /// If specified, the runner will be executed with profiler enabled.
+    /// The output file will contain Sierra stack trace with weights, in Flamegraph compatible format.
+    #[arg(long)]
+    profiler_output: Option<Utf8PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -142,7 +144,7 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             Some(Default::default())
         },
         Default::default(),
-        if args.run_profiler {
+        if args.profiler_output.is_some() {
             Some(ProfilingInfoCollectionConfig::default())
         } else {
             None
@@ -158,46 +160,12 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
         )
         .with_context(|| "failed to run the function")?;
 
-    if args.run_profiler {
-        ensure!(
-            sierra_program.debug_info.is_some(),
-            formatdoc! {r#"
-                sierra program artifacts do not contain debug info
-            "#}
-        );
-
-        let statements_functions = sierra_program
-            .debug_info
-            .unwrap()
-            .user_func_names
-            .iter()
-            .map(|(k, v)| (StatementIdx(k.id as usize), v.to_string()))
-            .collect();
-
-        let profiler_params = ProfilingInfoProcessorParams {
-            min_weight: 0,
-            process_by_user_function: true,
-            process_by_stack_trace: false,
-            process_by_cairo_stack_trace: false,
-            process_by_generic_libfunc: false,
-            process_by_original_user_function: false,
-            process_by_statement: false,
-            process_by_concrete_libfunc: false,
-            process_by_cairo_function: false,
-        };
-        let profiling_info_processor = ProfilingInfoProcessor::new(
-            None,
-            sierra_program.program,
-            statements_functions,
-            profiler_params,
-        );
-        match &result.profiling_info {
-            Some(raw_profiling_info) => {
-                let profiling_info = profiling_info_processor.process(&raw_profiling_info);
-                println!("Profiling info:\n{}", profiling_info);
-            }
-            None => println!("Warning: Profiling info not found."),
-        }
+    if let Some(output_path) = args.profiler_output {
+        save_profiler_output(
+            &sierra_program.program, 
+            result.profiling_info.as_ref().ok_or(anyhow!("profiling info is absent"))?, 
+            &output_path
+        ).with_context(|| "failed to write profiling info")?;
     }
 
     ui.print(Summary {
