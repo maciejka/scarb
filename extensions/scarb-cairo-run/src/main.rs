@@ -3,6 +3,7 @@ use std::fs;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use cairo_lang_runner::profiling::ProfilingInfoProcessor;
+use cairo_lang_runner::profiling::ProfilingInfoProcessorParams;
 use cairo_lang_runner::short_string::as_cairo_short_string;
 use cairo_lang_runner::ProfilingInfoCollectionConfig;
 use cairo_lang_runner::{RunResultStarknet, RunResultValue, SierraCasmRunner, StarknetState};
@@ -173,8 +174,23 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             .map(|(k, v)| (StatementIdx(k.id as usize), v.to_string()))
             .collect();
 
-        let profiling_info_processor =
-            ProfilingInfoProcessor::new(None, sierra_program.program, statements_functions);
+        let profiler_params = ProfilingInfoProcessorParams {
+            min_weight: 0,
+            process_by_user_function: true,
+            process_by_stack_trace: false,
+            process_by_cairo_stack_trace: false,
+            process_by_generic_libfunc: false,
+            process_by_original_user_function: false,
+            process_by_statement: false,
+            process_by_concrete_libfunc: false,
+            process_by_cairo_function: false,
+        };
+        let profiling_info_processor = ProfilingInfoProcessor::new(
+            None,
+            sierra_program.program,
+            statements_functions,
+            profiler_params,
+        );
         match &result.profiling_info {
             Some(raw_profiling_info) => {
                 let profiling_info = profiling_info_processor.process(&raw_profiling_info);
