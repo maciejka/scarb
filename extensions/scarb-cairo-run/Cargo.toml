@@ -10,6 +10,7 @@ authors.workspace = true
 anyhow.workspace = true
 cairo-lang-runner.workspace = true
 cairo-lang-sierra.workspace = true
+itertools.workspace = true
 camino.workspace = true
 clap.workspace = true
 indoc.workspace = true
