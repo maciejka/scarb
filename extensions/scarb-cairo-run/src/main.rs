@@ -144,11 +144,9 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             Some(Default::default())
         },
         Default::default(),
-        if args.profiler_output.is_some() {
-            Some(ProfilingInfoCollectionConfig::default())
-        } else {
-            None
-        },
+        args.profiler_output
+            .as_ref()
+            .map(|_| ProfilingInfoCollectionConfig::default()),
     )?;
 
     let result = runner
