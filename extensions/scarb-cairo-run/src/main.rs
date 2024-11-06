@@ -148,11 +148,9 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
             Some(Default::default())
         },
         Default::default(),
-        if args.profiler_output.is_some() {
-            Some(ProfilingInfoCollectionConfig::default())
-        } else {
-            None
-        },
+        args.profiler_output
+            .as_ref()
+            .map(|_| ProfilingInfoCollectionConfig::default()),
     )?;
 
     let result = runner
@@ -166,10 +164,14 @@ fn main_inner(ui: &Ui, args: Args) -> Result<()> {
 
     if let Some(output_path) = args.profiler_output {
         save_profiler_output(
-            &sierra_program.program, 
-            result.profiling_info.as_ref().ok_or(anyhow!("profiling info is absent"))?, 
-            &output_path
-        ).with_context(|| "failed to write profiling info")?;
+            &sierra_program.program,
+            result
+                .profiling_info
+                .as_ref()
+                .ok_or(anyhow!("profiling info is absent"))?,
+            &output_path,
+        )
+        .with_context(|| "failed to write profiling info")?;
     }
 
     ui.print(Summary {
