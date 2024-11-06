@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::process::ExitCode;
 
 use crate::args::{EmitTarget, FmtArgs};
 use crate::errors::error_with_exit_code;
@@ -29,12 +30,13 @@ pub fn run(args: FmtArgs, config: &Config) -> Result<()> {
             packages,
             action,
             color: !args.no_color,
+            path: args.path,
         },
         &ws,
     )? {
         Ok(())
     } else {
-        error_with_exit_code(1)
+        error_with_exit_code(ExitCode::FAILURE)
     }
 }
 

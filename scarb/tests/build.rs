@@ -278,6 +278,7 @@ fn compile_with_incompatible_cairo_version() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
             cairo-version = "33.33.0"
             "#,
         )
@@ -293,6 +294,39 @@ fn compile_with_incompatible_cairo_version() {
             Cairo version of Scarb: [..]
 
             error: the required Cairo version of each package must match the current Cairo version
+            help: pass `--ignore-cairo-version` to ignore Cairo version mismatch
+        "#});
+}
+
+#[test]
+fn compile_ignore_cairo_version() {
+    let t = TempDir::new().unwrap();
+    t.child("Scarb.toml")
+        .write_str(
+            r#"
+            [package]
+            name = "hello"
+            version = "0.1.0"
+            cairo-version = "33.33.0"
+            "#,
+        )
+        .unwrap();
+    t.child("src/lib.cairo")
+        .write_str("fn example() -> felt252 { 42 }")
+        .unwrap();
+    Scarb::quick_snapbox()
+        .args(["check", "--ignore-cairo-version"])
+        .current_dir(&t)
+        .assert()
+        .success()
+        .stdout_matches(indoc! {r#"
+            warn: `edition` field not set in `[package]` section for package `hello`
+            warn: the required Cairo version of package hello is not compatible with current version
+            Cairo version required: ^33.33.0
+            Cairo version of Scarb: [..]
+
+            [..] Checking hello v0.1.0 ([..]Scarb.toml)
+            [..] Finished checking `dev` profile target(s) in [..]
         "#});
 }
 
@@ -345,6 +379,27 @@ fn compile_with_invalid_non_numeric_dep_version() {
 }
 
 #[test]
+fn compile_with_unset_edition() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .version("0.1.0")
+        .no_edition()
+        .build(&t);
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .current_dir(&t)
+        .assert()
+        .success()
+        .stdout_matches(indoc! {r#"
+            warn: `edition` field not set in `[package]` section for package `hello`
+            [..] Compiling hello v0.1.0 ([..]Scarb.toml)
+            [..]  Finished `dev` profile target(s) in [..]
+        "#});
+}
+
+#[test]
 fn compile_multiple_packages() {
     let t = TempDir::new().unwrap();
 
@@ -354,6 +409,7 @@ fn compile_multiple_packages() {
             [package]
             name = "fib"
             version = "1.0.0"
+            edition = "2023_01"
 
             [dependencies]
             decrement = { path = "decrement" }
@@ -386,6 +442,7 @@ fn compile_multiple_packages() {
             [package]
             name = "decrement"
             version = "1.0.0"
+            edition = "2023_01"
             "#,
         )
         .unwrap();
@@ -422,6 +479,7 @@ fn compile_with_nested_deps() {
             [package]
             name = "x"
             version = "1.0.0"
+            edition = "2023_01"
 
             [dependencies]
             y = { path = "y" }
@@ -439,6 +497,7 @@ fn compile_with_nested_deps() {
             [package]
             name = "y"
             version = "1.0.0"
+            edition = "2023_01"
 
             [dependencies]
             q = { path = "../q" }
@@ -457,6 +516,7 @@ fn compile_with_nested_deps() {
             [package]
             name = "z"
             version = "1.0.0"
+            edition = "2023_01"
 
             [dependencies]
             q = { path = "../q" }
@@ -474,6 +534,7 @@ fn compile_with_nested_deps() {
             [package]
             name = "q"
             version = "1.0.0"
+            edition = "2023_01"
             "#,
         )
         .unwrap();
@@ -1512,4 +1573,72 @@ fn add_statements_code_locations_debug_info_to_tests() {
         .is_ok(),
         "Expected statements_code_locations info to be a map"
     );
+}
+
+#[test]
+fn can_import_from_self_by_name() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .lib_cairo(indoc! {r#"
+            fn fib(mut n: u32) -> u32 {
+                let mut a: u32 = 0;
+                let mut b: u32 = 1;
+                while n != 0 {
+                    n = n - 1;
+                    let temp = b;
+                    b = a + b;
+                    a = temp;
+                };
+                a
+            }
+            
+            mod some {
+                use hello::fib;
+                
+                fn main() -> u32 {
+                    fib(16)
+                }
+            }
+        "#})
+        .build(&t);
+    Scarb::quick_snapbox()
+        .arg("build")
+        .current_dir(&t)
+        .assert()
+        .success();
+}
+
+#[test]
+fn can_build_with_add_redeposit_gas() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .lib_cairo(indoc! {r#"
+            fn main() -> u32 {
+                fib(16)
+            }
+
+            fn fib(mut n: u32) -> u32 {
+                let mut a: u32 = 0;
+                let mut b: u32 = 1;
+                while n != 0 {
+                    n = n - 1;
+                    let temp = b;
+                    b = a + b;
+                    a = temp;
+                };
+                a
+            }
+        "#})
+        .manifest_extra(indoc! {r#"
+            [cairo]
+            add-redeposit-gas = true
+        "#})
+        .build(&t);
+    Scarb::quick_snapbox()
+        .arg("build")
+        .current_dir(&t)
+        .assert()
+        .success();
 }

@@ -1,7 +1,7 @@
 use crate::compiler::plugin::{fetch_cairo_plugin, CairoPluginProps};
 use crate::compiler::{
     CairoCompilationUnit, CompilationUnit, CompilationUnitAttributes, CompilationUnitCairoPlugin,
-    CompilationUnitComponent, ProcMacroCompilationUnit, Profile,
+    CompilationUnitComponent, CompilationUnitComponentId, ProcMacroCompilationUnit, Profile,
 };
 use crate::core::lockfile::Lockfile;
 use crate::core::package::{Package, PackageClass, PackageId};
@@ -26,6 +26,7 @@ use futures::TryFutureExt;
 use indoc::formatdoc;
 use itertools::Itertools;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::iter::zip;
 
 pub struct WorkspaceResolve {
     pub resolve: Resolve,
@@ -170,6 +171,7 @@ async fn collect_packages_from_resolve_graph(
 pub fn generate_compilation_units(
     resolve: &WorkspaceResolve,
     enabled_features: &FeaturesOpts,
+    ignore_cairo_version: bool,
     ws: &Workspace<'_>,
 ) -> Result<Vec<CompilationUnit>> {
     let mut units = Vec::with_capacity(ws.members().size_hint().0);
@@ -183,6 +185,7 @@ pub fn generate_compilation_units(
             &member,
             resolve,
             enabled_features,
+            ignore_cairo_version,
             ws,
         )?);
     }
@@ -235,6 +238,7 @@ fn generate_cairo_compilation_units(
     member: &Package,
     resolve: &WorkspaceResolve,
     enabled_features: &FeaturesOpts,
+    ignore_cairo_version: bool,
     ws: &Workspace<'_>,
 ) -> Result<Vec<CompilationUnit>> {
     let profile = ws.current_profile()?;
@@ -255,6 +259,7 @@ fn generate_cairo_compilation_units(
                 member,
                 profile.clone(),
                 enabled_features,
+                ignore_cairo_version,
                 &mut solution,
             )?))
         })
@@ -270,6 +275,7 @@ fn generate_cairo_compilation_units(
                 member,
                 profile.clone(),
                 enabled_features,
+                ignore_cairo_version,
                 &mut solution,
             )?))
         })
@@ -286,10 +292,11 @@ fn cairo_compilation_unit_for_target(
     member: &Package,
     profile: Profile,
     enabled_features: &FeaturesOpts,
+    ignore_cairo_version: bool,
     solution: &mut PackageSolutionCollector<'_>,
 ) -> Result<CairoCompilationUnit> {
     let member_target = member_targets.first().cloned().unwrap();
-    solution.collect(&member_target.kind)?;
+    solution.collect(&member_target.kind, ignore_cairo_version)?;
     let packages = solution.packages.as_ref().unwrap();
     let cairo_plugins = solution.cairo_plugins.as_ref().unwrap();
 
@@ -377,7 +384,11 @@ fn cairo_compilation_unit_for_target(
         components.push(CompilationUnitComponent::try_new(
             member.clone(),
             vec![target],
-            no_test_cfg_set,
+            get_cfg_with_features(
+                no_test_cfg_set.unwrap_or(CfgSet::new()),
+                &member.manifest.features,
+                enabled_features,
+            )?,
         )?);
 
         // Set test package as main package for this compilation unit.
@@ -385,6 +396,61 @@ fn cairo_compilation_unit_for_target(
     } else {
         member.id
     };
+
+    // Collect dependencies for the components.
+    let dependencies_for_components: Vec<_> = components
+        .iter()
+        .map(|component| {
+            // Those are direct dependencies of the component.
+            let dependencies_summary: Vec<&ManifestDependency> = component
+                .package
+                .manifest
+                .summary
+                .full_dependencies()
+                .collect();
+
+            // We iterate over all the compilation unit components to get dependency's version.
+            let mut dependencies: Vec<CompilationUnitComponentId> = components
+                .iter()
+                .filter(|component_as_dependency| {
+                    dependencies_summary.iter().any(|dependency_summary| {
+                        dependency_summary.name == component_as_dependency.package.id.name
+                    }) ||
+                        // This is a hacky way of accommodating integration test components,
+                        // which need to depend on the tested package.
+                        component_as_dependency
+                            .package
+                            .manifest
+                            .targets
+                            .iter()
+                            .filter(|target| target.kind.is_test())
+                            .any(|target| {
+                                target.group_id.clone().unwrap_or(target.name.clone())
+                                    == component.package.id.name.to_smol_str()
+                                    && component_as_dependency.cairo_package_name() != component.cairo_package_name()
+                            })
+                })
+                .map(|compilation_unit_component| compilation_unit_component.id.clone()
+                )
+                .collect();
+
+            // Adds itself to dependencies
+            let is_integration_test = if component.first_target().kind.is_test() {
+                let props: Option<TestTargetProps> = component.first_target().props().ok();
+                props
+                    .map(|props| props.test_type == TestTargetType::Integration)
+                    .unwrap_or_default()
+            } else { false };
+            if !is_integration_test {
+                dependencies.push(component.id.clone());
+            }
+
+            dependencies
+        }).collect();
+
+    for (component, dependencies) in zip(&mut components, dependencies_for_components) {
+        component.dependencies = dependencies;
+    }
 
     Ok(CairoCompilationUnit {
         main_package_id,
@@ -475,7 +541,7 @@ impl<'a> PackageSolutionCollector<'a> {
         }
     }
 
-    pub fn collect(&mut self, target_kind: &TargetKind) -> Result<()> {
+    pub fn collect(&mut self, target_kind: &TargetKind, ignore_cairo_version: bool) -> Result<()> {
         // Do not traverse graph for each target of the same kind.
         if !self
             .target_kind
@@ -483,7 +549,7 @@ impl<'a> PackageSolutionCollector<'a> {
             .map(|tk| tk == target_kind)
             .unwrap_or(false)
         {
-            let (p, c) = self.pull_from_graph(target_kind)?;
+            let (p, c) = self.pull_from_graph(target_kind, ignore_cairo_version)?;
             self.packages = Some(p.clone());
             self.cairo_plugins = Some(c.clone());
             self.target_kind = Some(target_kind.clone());
@@ -494,6 +560,7 @@ impl<'a> PackageSolutionCollector<'a> {
     fn pull_from_graph(
         &mut self,
         target_kind: &TargetKind,
+        ignore_cairo_version: bool,
     ) -> Result<(Vec<Package>, Vec<CompilationUnitCairoPlugin>)> {
         let mut classes = self
             .resolve
@@ -530,7 +597,12 @@ impl<'a> PackageSolutionCollector<'a> {
         assert!(!packages.is_empty());
         assert_eq!(packages[0].id, self.member.id);
 
-        check_cairo_version_compatibility(&packages, self.ws)?;
+        check_cairo_version_compatibility(
+            &packages,
+            self.ws,
+            &mut self.warnings,
+            ignore_cairo_version,
+        )?;
 
         // Print warnings for dependencies that are not usable.
         let other = classes.remove(&PackageClass::Other).unwrap_or_default();
@@ -573,13 +645,18 @@ fn build_cfg_set(target: &Target) -> CfgSet {
     cfg
 }
 
-fn check_cairo_version_compatibility(packages: &[Package], ws: &Workspace<'_>) -> Result<()> {
+fn check_cairo_version_compatibility(
+    packages: &[Package],
+    ws: &Workspace<'_>,
+    warnings: &mut HashSet<String>,
+    ignore_mismatch: bool,
+) -> Result<()> {
     let current_version = crate::version::get().cairo.version.to_version().unwrap();
     let matching_version = packages
         .iter()
         .all(|pkg| match &pkg.manifest.metadata.cairo_version {
             Some(package_version) if !package_version.matches(&current_version) => {
-                ws.config().ui().error(formatdoc!(
+                let msg = formatdoc!(
                     r"
                     the required Cairo version of package {} is not compatible with current version
                     Cairo version required: {}
@@ -588,13 +665,21 @@ fn check_cairo_version_compatibility(packages: &[Package], ws: &Workspace<'_>) -
                     pkg.id.name,
                     package_version,
                     current_version
-                ));
+                );
+                if ignore_mismatch {
+                    warnings.insert(msg);
+                } else {
+                    ws.config().ui().error(msg);
+                }
                 false
             }
             _ => true,
         });
-    if !matching_version {
-        bail!("the required Cairo version of each package must match the current Cairo version");
+    if !matching_version && !ignore_mismatch {
+        bail!(formatdoc! { r"
+                the required Cairo version of each package must match the current Cairo version
+                help: pass `--ignore-cairo-version` to ignore Cairo version mismatch
+            "})
     }
     Ok(())
 }

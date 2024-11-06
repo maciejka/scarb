@@ -24,8 +24,8 @@ use crate::core::manifest::{ManifestDependency, ManifestMetadata, Summary, Targe
 use crate::core::package::PackageId;
 use crate::core::source::{GitReference, SourceId};
 use crate::core::{
-    DepKind, DependencyVersionReq, InliningStrategy, ManifestBuilder, ManifestCompilerConfig,
-    PackageName, TargetKind, TestTargetProps, TestTargetType,
+    Config, DepKind, DependencyVersionReq, InliningStrategy, ManifestBuilder,
+    ManifestCompilerConfig, PackageName, TargetKind, TestTargetProps, TestTargetType,
 };
 use crate::internal::fsx;
 use crate::internal::fsx::PathBufUtf8Ext;
@@ -46,7 +46,7 @@ pub struct TomlManifest {
     pub dependencies: Option<BTreeMap<PackageName, MaybeTomlWorkspaceDependency>>,
     pub dev_dependencies: Option<BTreeMap<PackageName, MaybeTomlWorkspaceDependency>>,
     pub lib: Option<TomlTarget<TomlLibTargetParams>>,
-    pub cairo_plugin: Option<TomlTarget<TomlExternalTargetParams>>,
+    pub cairo_plugin: Option<TomlTarget<TomlCairoPluginTargetParams>>,
     pub test: Option<Vec<TomlTarget<TomlExternalTargetParams>>>,
     pub target: Option<BTreeMap<TargetKind, Vec<TomlTarget<TomlExternalTargetParams>>>>,
     pub cairo: Option<TomlCairo>,
@@ -294,6 +294,12 @@ pub struct TomlLibTargetParams {
     pub sierra_text: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TomlCairoPluginTargetParams {
+    pub builtin: Option<bool>,
+}
+
 pub type TomlExternalTargetParams = BTreeMap<SmolStr, toml::Value>;
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -315,6 +321,8 @@ pub struct TomlCairo {
     pub allow_warnings: Option<bool>,
     /// Enable auto gas withdrawal and gas usage check.
     pub enable_gas: Option<bool>,
+    /// Add a call to the redeposits_gas libfunc in a bunch of places.
+    pub add_redeposit_gas: Option<bool>,
     /// Add a mapping between sierra statement indexes and fully qualified paths of cairo functions
     /// to debug info. A statement index maps to a vector consisting of a function which caused the
     /// statement to be generated and all functions that were inlined or generated along the way.
@@ -399,6 +407,7 @@ impl TomlManifest {
         source_id: SourceId,
         profile: Profile,
         workspace_manifest: Option<&TomlManifest>,
+        config: &Config,
     ) -> Result<Manifest> {
         let root = manifest_path
             .parent()
@@ -574,7 +583,15 @@ impl TomlManifest {
             .clone()
             .map(|edition| edition.resolve("edition", || inheritable_package.edition()))
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if !targets.iter().any(Target::is_cairo_plugin) {
+                    config.ui().warn(format!(
+                        "`edition` field not set in `[package]` section for package `{}`",
+                        package_id.name
+                    ));
+                }
+                Edition::default()
+            });
 
         // TODO (#1040): add checking for fields that are not present in ExperimentalFeaturesConfig
         let experimental_features = package.experimental_features.clone();
@@ -640,18 +657,18 @@ impl TomlManifest {
 
         // Skip autodetect for cairo plugins.
         let auto_detect = !targets.iter().any(Target::is_cairo_plugin);
-        targets.extend(self.collect_test_targets(package_name.clone(), root, auto_detect)?);
+        self.collect_test_targets(&mut targets, package_name.clone(), root, auto_detect)?;
 
         Ok(targets)
     }
 
     fn collect_test_targets(
         &self,
+        targets: &mut Vec<Target>,
         package_name: SmolStr,
         root: &Utf8Path,
         auto_detect: bool,
-    ) -> Result<Vec<Target>> {
-        let mut targets = Vec::new();
+    ) -> Result<()> {
         if let Some(test) = self.test.as_ref() {
             // Read test targets from manifest file.
             for test_toml in test {
@@ -665,13 +682,31 @@ impl TomlManifest {
             }
         } else if auto_detect {
             // Auto-detect test target.
+            let external_contracts = targets
+                .iter()
+                .filter(|target| target.kind == TargetKind::STARKNET_CONTRACT)
+                .filter_map(|target| target.params.get("build-external-contracts"))
+                .filter_map(|value| value.as_array())
+                .flatten()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .sorted()
+                .dedup()
+                .collect_vec();
             let source_path = self.lib.as_ref().and_then(|l| l.source_path.clone());
             let target_name: SmolStr = format!("{package_name}_unittest").into();
             let target_config = TomlTarget::<TomlExternalTargetParams> {
                 name: Some(target_name),
                 source_path,
-                params: TestTargetProps::default().try_into()?,
+                params: TestTargetProps::default()
+                    .with_build_external_contracts(external_contracts.clone())
+                    .try_into()?,
             };
+            let external_contracts = external_contracts
+                .into_iter()
+                .chain(vec![format!("{package_name}::*")])
+                .sorted()
+                .dedup()
+                .collect_vec();
             targets.extend(Self::collect_target::<TomlExternalTargetParams>(
                 TargetKind::TEST,
                 Some(&target_config),
@@ -681,16 +716,23 @@ impl TomlManifest {
             )?);
             // Auto-detect test targets from `tests` directory.
             let tests_path = root.join(DEFAULT_TESTS_PATH);
+            let integration_target_config = |target_name, source_path| {
+                let result: Result<TomlTarget<TomlExternalTargetParams>> =
+                    Ok(TomlTarget::<TomlExternalTargetParams> {
+                        name: Some(target_name),
+                        source_path: Some(source_path),
+                        params: TestTargetProps::new(TestTargetType::Integration)
+                            .with_build_external_contracts(external_contracts.clone())
+                            .try_into()?,
+                    });
+                result
+            };
             if tests_path.join(DEFAULT_MODULE_MAIN_FILE).exists() {
                 // Tests directory contains `lib.cairo` file.
                 // Treat whole tests directory as single module.
                 let source_path = tests_path.join(DEFAULT_MODULE_MAIN_FILE);
                 let target_name: SmolStr = format!("{package_name}_{DEFAULT_TESTS_PATH}").into();
-                let target_config = TomlTarget::<TomlExternalTargetParams> {
-                    name: Some(target_name),
-                    source_path: Some(source_path),
-                    params: TestTargetProps::new(TestTargetType::Integration).try_into()?,
-                };
+                let target_config = integration_target_config(target_name, source_path)?;
                 targets.extend(Self::collect_target::<TomlExternalTargetParams>(
                     TargetKind::TEST,
                     Some(&target_config),
@@ -720,11 +762,7 @@ impl TomlManifest {
                         }
                         let file_stem = source_path.file_stem().unwrap().to_string();
                         let target_name: SmolStr = format!("{package_name}_{file_stem}").into();
-                        let target_config = TomlTarget::<TomlExternalTargetParams> {
-                            name: Some(target_name),
-                            source_path: Some(source_path),
-                            params: TestTargetProps::new(TestTargetType::Integration).try_into()?,
-                        };
+                        let target_config = integration_target_config(target_name, source_path)?;
                         targets.extend(Self::collect_target(
                             TargetKind::TEST,
                             Some(&target_config),
@@ -736,7 +774,7 @@ impl TomlManifest {
                 }
             }
         };
-        Ok(targets)
+        Ok(())
     }
 
     fn collect_target<T: Serialize>(
@@ -855,6 +893,9 @@ impl TomlManifest {
             }
             if let Some(enable_gas) = cairo.enable_gas {
                 compiler_config.enable_gas = enable_gas;
+            }
+            if let Some(add_redeposit_gas) = cairo.add_redeposit_gas {
+                compiler_config.add_redeposit_gas = add_redeposit_gas;
             }
             if let Some(unstable_add_statements_functions_debug_info) =
                 cairo.unstable_add_statements_functions_debug_info

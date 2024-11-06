@@ -90,16 +90,12 @@ impl From<cairo_lang_lowering::utils::InliningStrategy> for InliningStrategy {
 }
 
 pub fn collect_main_crate_ids(unit: &CairoCompilationUnit, db: &RootDatabase) -> Vec<CrateId> {
-    vec![db.intern_crate(CrateLongId::Real(
-        unit.main_component().cairo_package_name(),
-    ))]
-}
-
-pub fn collect_all_crate_ids(unit: &CairoCompilationUnit, db: &RootDatabase) -> Vec<CrateId> {
-    unit.components
-        .iter()
-        .map(|component| db.intern_crate(CrateLongId::Real(component.cairo_package_name())))
-        .collect()
+    let main_component = unit.main_component();
+    let name = main_component.cairo_package_name();
+    vec![db.intern_crate(CrateLongId::Real {
+        discriminator: main_component.id.to_discriminator(),
+        name,
+    })]
 }
 
 pub fn write_json(

@@ -4,10 +4,13 @@ use cairo_lang_compiler::project::{AllCratesConfig, ProjectConfig, ProjectConfig
 use cairo_lang_defs::db::DefsGroup;
 use cairo_lang_defs::ids::ModuleId;
 use cairo_lang_defs::plugin::MacroPlugin;
-use cairo_lang_filesystem::db::{AsFilesGroupMut, CrateSettings, FilesGroup, FilesGroupEx};
-use cairo_lang_filesystem::ids::{CrateLongId, Directory};
+use cairo_lang_filesystem::db::{
+    AsFilesGroupMut, CrateIdentifier, CrateSettings, DependencySettings, FilesGroup, FilesGroupEx,
+};
+use cairo_lang_filesystem::ids::CrateLongId;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use smol_str::SmolStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -32,6 +35,9 @@ pub(crate) fn build_scarb_root_database(
     let proc_macro_host = load_plugins(unit, ws, &mut b)?;
     if !unit.compiler_config.enable_gas {
         b.skip_auto_withdraw_gas();
+    }
+    if unit.compiler_config.add_redeposit_gas {
+        b.with_add_redeposit_gas();
     }
     let mut db = b.build()?;
     inject_virtual_wrapper_lib(&mut db, unit)?;
@@ -86,8 +92,11 @@ fn inject_virtual_wrapper_lib(db: &mut RootDatabase, unit: &CairoCompilationUnit
         .collect();
 
     for component in components {
-        let crate_name = component.cairo_package_name();
-        let crate_id = db.intern_crate(CrateLongId::Real(crate_name));
+        let name = component.cairo_package_name();
+        let crate_id = db.intern_crate(CrateLongId::Real {
+            name,
+            discriminator: component.id.to_discriminator(),
+        });
         let file_stems = component
             .targets
             .iter()
@@ -116,30 +125,47 @@ fn inject_virtual_wrapper_lib(db: &mut RootDatabase, unit: &CairoCompilationUnit
 }
 
 fn build_project_config(unit: &CairoCompilationUnit) -> Result<ProjectConfig> {
-    let crate_roots = unit
+    let crate_roots: OrderedHashMap<CrateIdentifier, PathBuf> = unit
         .components
         .iter()
-        .filter(|component| !component.package.id.is_core())
         .map(|component| {
             (
-                component.cairo_package_name(),
+                component.id.to_crate_identifier(),
                 component.first_target().source_root().into(),
             )
         })
         .collect();
 
-    let crates_config: OrderedHashMap<SmolStr, CrateSettings> = unit
+    let crates_config = unit
         .components
         .iter()
         .map(|component| {
             let experimental_features = component.package.manifest.experimental_features.clone();
             let experimental_features = experimental_features.unwrap_or_default();
+
+            let dependencies = component
+                .dependencies
+                .iter()
+                .map(|compilation_unit_component_id| {
+                    let compilation_unit_component = unit.components.iter().find(|component| component.id == *compilation_unit_component_id)
+                        .expect("dependency of a component is guaranteed to exist in compilation unit components");
+                    (
+                        compilation_unit_component.cairo_package_name().to_string(),
+                        DependencySettings {
+                            discriminator: compilation_unit_component.id.to_discriminator()
+                        },
+                    )
+                })
+                .collect();
+
             (
-                component.cairo_package_name(),
+                component.id.to_crate_identifier(),
                 CrateSettings {
+                    name: Some(component.cairo_package_name()),
                     edition: component.package.manifest.edition,
                     cfg_set: component.cfg_set.clone(),
                     version: Some(component.package.id.version.clone()),
+                    dependencies,
                     // TODO (#1040): replace this with a macro
                     experimental_features: cairo_lang_filesystem::db::ExperimentalFeaturesConfig {
                         negative_impls: experimental_features
@@ -155,10 +181,6 @@ fn build_project_config(unit: &CairoCompilationUnit) -> Result<ProjectConfig> {
         ..Default::default()
     };
 
-    let corelib = unit
-        .core_package_component()
-        .map(|core| Directory::Real(core.first_target().source_root().into()));
-
     let content = ProjectConfigContent {
         crate_roots,
         crates_config,
@@ -166,7 +188,6 @@ fn build_project_config(unit: &CairoCompilationUnit) -> Result<ProjectConfig> {
 
     let project_config = ProjectConfig {
         base_path: unit.main_component().package.root().into(),
-        corelib,
         content,
     };
 

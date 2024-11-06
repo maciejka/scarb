@@ -233,6 +233,10 @@ pub struct BuildArgs {
     /// Specify features to enable.
     #[command(flatten)]
     pub features: FeaturesSpec,
+
+    /// Do not error on `cairo-version` mismatch.
+    #[arg(long)]
+    pub ignore_cairo_version: bool,
 }
 
 /// Arguments accepted by the `expand` command.
@@ -244,6 +248,10 @@ pub struct ExpandArgs {
     /// Specify features to enable.
     #[command(flatten)]
     pub features: FeaturesSpec,
+
+    /// Do not error on `cairo-version` mismatch.
+    #[arg(long)]
+    pub ignore_cairo_version: bool,
 
     /// Specify the target to expand by target kind.
     #[arg(long)]
@@ -316,6 +324,10 @@ pub struct MetadataArgs {
     /// Specify features to enable.
     #[command(flatten)]
     pub features: FeaturesSpec,
+
+    /// Do not error on `cairo-version` mismatch.
+    #[arg(long)]
+    pub ignore_cairo_version: bool,
 }
 
 /// Arguments accepted by the `new` command.
@@ -341,6 +353,9 @@ pub struct FmtArgs {
     /// Specify package(s) to format.
     #[command(flatten)]
     pub packages_filter: PackagesFilter,
+    /// Path to a file or directory to format. If provided, only this file or directory will be formatted.
+    #[clap(value_name = "PATH")]
+    pub path: Option<Utf8PathBuf>,
 }
 
 /// Arguments accepted by the `add` command.
@@ -486,6 +501,10 @@ pub struct PackageArgs {
     /// Specify features to enable.
     #[command(flatten)]
     pub features: FeaturesSpec,
+
+    /// Do not error on `cairo-version` mismatch.
+    #[arg(long)]
+    pub ignore_cairo_version: bool,
 }
 
 /// Arguments accepted by the `publish` command.
@@ -504,6 +523,10 @@ pub struct PublishArgs {
     /// Specify features to enable.
     #[command(flatten)]
     pub features: FeaturesSpec,
+
+    /// Do not error on `cairo-version` mismatch.
+    #[arg(long)]
+    pub ignore_cairo_version: bool,
 }
 
 /// Git reference specification arguments.

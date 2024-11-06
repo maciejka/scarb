@@ -1,16 +1,17 @@
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use cairo_lang_sierra::program::VersionedProgram;
-use indoc::indoc;
+use cairo_lang_starknet_classes::contract_class::ContractClass;
+use indoc::{formatdoc, indoc};
 use itertools::Itertools;
 use predicates::prelude::*;
 use scarb_metadata::Metadata;
-use std::path::PathBuf;
-
 use scarb_test_support::command::{CommandExt, Scarb};
+use scarb_test_support::contracts::{BALANCE_CONTRACT, FORTY_TWO_CONTRACT, HELLO_CONTRACT};
 use scarb_test_support::fsx;
 use scarb_test_support::fsx::ChildPathEx;
-use scarb_test_support::project_builder::ProjectBuilder;
+use scarb_test_support::project_builder::{Dep, DepBuilder, ProjectBuilder};
+use std::path::PathBuf;
 
 #[test]
 fn compile_with_duplicate_targets_1() {
@@ -21,6 +22,7 @@ fn compile_with_duplicate_targets_1() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
 
             [[target.example]]
 
@@ -51,6 +53,7 @@ fn compile_with_duplicate_targets_2() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
 
             [[target.example]]
             name = "x"
@@ -83,6 +86,7 @@ fn compile_with_custom_lib_target() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
 
             [lib]
             name = "not_hello"
@@ -129,6 +133,7 @@ fn compile_with_named_default_lib_target() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
 
             [lib]
             name = "not_hello"
@@ -172,6 +177,7 @@ fn compile_with_lib_target_in_target_array() {
             [package]
             name = "hello"
             version = "0.1.0"
+            edition = "2023_01"
 
             [[target.lib]]
             name = "not_hello"
@@ -414,6 +420,151 @@ fn integration_tests_do_not_enable_cfg_in_main_package() {
 
             error: could not compile `hello_integrationtest` due to previous error
         "#});
+}
+
+#[test]
+fn integration_tests_cannot_use_itself_by_target_name() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .dep_cairo_test()
+        .lib_cairo(indoc! {r#"
+            fn hello_world() -> felt252 { 42 }
+        "#})
+        .build(&t);
+    t.child("tests").create_dir_all().unwrap();
+    t.child("tests/test1.cairo")
+        .write_str(indoc! {r#"
+        pub fn hello() -> felt252 { 12 }
+        pub fn beautiful() -> felt252 { 34 }
+        pub fn world() -> felt252 { 56 }
+
+        mod tests {
+            use hello_integrationtest::test1::world;
+            use hello_tests::test1::beautiful;
+            use crate::test1::hello;
+
+            #[test]
+            fn test_1() {
+                assert(world() == 12, '');
+            }
+        }
+        "#})
+        .unwrap();
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .arg("--test")
+        .current_dir(&t)
+        .assert()
+        .failure()
+        .stdout_matches(indoc! {r#"
+            [..]Compiling test(hello_unittest) hello v1.0.0 ([..]Scarb.toml)
+            [..]Compiling test(hello_integrationtest) hello_integrationtest v1.0.0 ([..]Scarb.toml)
+            error: Identifier not found.
+             --> [..]test1.cairo:6:9
+                use hello_integrationtest::test1::world;
+                    ^*******************^
+
+            error: Identifier not found.
+             --> [..]test1.cairo:7:9
+                use hello_tests::test1::beautiful;
+                    ^*********^
+
+            error: Type annotations needed. Failed to infer ?0.
+             --> [..]test1.cairo:12:16
+                    assert(world() == 12, '');
+                           ^***********^
+
+            error: could not compile `hello_integrationtest` due to previous error
+        "#});
+}
+
+#[test]
+fn features_enabled_in_integration_tests() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .dep_cairo_test()
+        .manifest_extra(indoc! {r#"
+            [features]
+            x = []
+        "#})
+        .lib_cairo(indoc! {r#"
+            #[cfg(feature: 'x')]
+            fn f() -> felt252 { 42 }
+
+            fn main() -> felt252 {
+                0
+            }
+        "#})
+        .build(&t);
+
+    t.child("tests/test1.cairo")
+        .write_str(indoc! {r#"
+            #[cfg(test)]
+            mod tests {
+                use hello::f;
+
+                #[test]
+                fn test_feature_function() {
+                    assert(f() == 42, 'it works!');
+                }
+            }
+        "#})
+        .unwrap();
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .arg("--test")
+        .current_dir(&t)
+        .assert()
+        .failure()
+        .stdout_matches(indoc! {r#"
+            [..] Compiling test(hello_unittest) hello v1.0.0 ([..]Scarb.toml)
+            [..] Compiling test(hello_integrationtest) hello_integrationtest v1.0.0 ([..])
+            error: Identifier not found.
+             --> [..]test1.cairo:3:16
+                use hello::f;
+                           ^
+
+            error: Type annotations needed. Failed to infer ?0.
+             --> [..]test1.cairo:7:16
+                    assert(f() == 42, 'it works!');
+                           ^*******^
+
+            error: could not compile `hello_integrationtest` due to previous error
+        "#});
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .arg("--test")
+        .arg("--features")
+        .arg("x")
+        .current_dir(&t)
+        .assert()
+        .success();
+
+    assert_eq!(
+        t.child("target/dev").files(),
+        vec![
+            "hello_integrationtest.test.json",
+            "hello_integrationtest.test.sierra.json",
+            "hello_unittest.test.json",
+            "hello_unittest.test.sierra.json",
+        ]
+    );
+
+    t.child("target/dev/hello_integrationtest.test.json")
+        .assert_is_json::<serde_json::Value>();
+    t.child("target/dev/hello_integrationtest.test.sierra.json")
+        .assert_is_json::<VersionedProgram>();
+    let content = t
+        .child("target/dev/hello_integrationtest.test.json")
+        .read_to_string();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let tests = json.get("named_tests").unwrap().as_array().unwrap();
+    assert_eq!(tests.len(), 1);
 }
 
 #[test]
@@ -723,4 +874,176 @@ fn can_use_test_and_target_names() {
         .current_dir(&t)
         .assert()
         .success();
+}
+
+#[test]
+fn test_target_builds_contracts() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("hello")
+        .version("0.1.0")
+        .manifest_extra(indoc! {r#"
+            [lib]
+            sierra = true
+
+            [[target.starknet-contract]]
+        "#})
+        .dep_starknet()
+        .dep_cairo_test()
+        .lib_cairo(indoc! {r#"
+            pub mod balance;
+            pub mod forty_two;
+        "#})
+        .src("src/balance.cairo", BALANCE_CONTRACT)
+        .src("src/forty_two.cairo", FORTY_TWO_CONTRACT)
+        .build(&t);
+
+    t.child("tests/contract_test.cairo")
+        .write_str(
+            formatdoc! {r#"
+        #[cfg(test)]
+        mod tests {{
+
+            {HELLO_CONTRACT}
+
+            use array::ArrayTrait;
+            use core::result::ResultTrait;
+            use core::traits::Into;
+            use option::OptionTrait;
+            use starknet::syscalls::deploy_syscall;
+            use traits::TryInto;
+
+            use hello::balance::{{Balance, IBalance, IBalanceDispatcher, IBalanceDispatcherTrait}};
+
+            #[test]
+            fn test_flow() {{
+                let calldata = array![100];
+                let (address0, _) = deploy_syscall(
+                    Balance::TEST_CLASS_HASH.try_into().unwrap(), 0, calldata.span(), false
+                )
+                    .unwrap();
+                let mut contract0 = IBalanceDispatcher {{ contract_address: address0 }};
+
+                let calldata = array![200];
+                let (address1, _) = deploy_syscall(
+                    Balance::TEST_CLASS_HASH.try_into().unwrap(), 0, calldata.span(), false
+                )
+                    .unwrap();
+                let mut contract1 = IBalanceDispatcher {{ contract_address: address1 }};
+
+                assert_eq!(@contract0.get(), @100, "contract0.get() == 100");
+                assert_eq!(@contract1.get(), @200, "contract1.get() == 200");
+                @contract1.increase(200);
+                assert_eq!(@contract0.get(), @100, "contract0.get() == 100");
+                assert_eq!(@contract1.get(), @400, "contract1.get() == 400");
+            }}
+        }}
+    "#}
+            .as_str(),
+        )
+        .unwrap();
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .arg("--test")
+        .current_dir(&t)
+        .assert()
+        .success()
+        .stdout_matches(indoc! {r#"
+        [..]Compiling test(hello_unittest) hello v0.1.0 ([..]Scarb.toml)
+        [..]Compiling test(hello_integrationtest) hello_integrationtest v0.1.0 ([..]Scarb.toml)
+        [..]  Finished `dev` profile target(s) in [..]
+        "#});
+
+    assert_eq!(
+        t.child("target/dev").files(),
+        vec![
+            "hello_integrationtest.test.json",
+            "hello_integrationtest.test.sierra.json",
+            "hello_integrationtest.test.starknet_artifacts.json",
+            "hello_integrationtest_Balance.test.contract_class.json",
+            "hello_integrationtest_FortyTwo.test.contract_class.json",
+            "hello_integrationtest_HelloContract.test.contract_class.json",
+            "hello_unittest.test.json",
+            "hello_unittest.test.sierra.json",
+            "hello_unittest.test.starknet_artifacts.json",
+            "hello_unittest_Balance.test.contract_class.json",
+            "hello_unittest_FortyTwo.test.contract_class.json"
+        ]
+    );
+
+    for json in [
+        "hello_integrationtest_Balance.test.contract_class.json",
+        "hello_integrationtest_FortyTwo.test.contract_class.json",
+        "hello_integrationtest_HelloContract.test.contract_class.json",
+        "hello_unittest_Balance.test.contract_class.json",
+        "hello_unittest_FortyTwo.test.contract_class.json",
+    ] {
+        t.child("target/dev")
+            .child(json)
+            .assert_is_json::<ContractClass>();
+    }
+
+    t.child("target/dev/hello_integrationtest.test.starknet_artifacts.json")
+        .assert_is_json::<serde_json::Value>();
+    t.child("target/dev/hello_unittest.test.starknet_artifacts.json")
+        .assert_is_json::<serde_json::Value>();
+}
+
+#[test]
+fn test_target_builds_external() {
+    let t = TempDir::new().unwrap();
+    ProjectBuilder::start()
+        .name("first")
+        .version("0.1.0")
+        .manifest_extra(indoc! {r#"
+            [lib]
+            [[target.starknet-contract]]
+        "#})
+        .dep_starknet()
+        .dep_cairo_test()
+        .lib_cairo(HELLO_CONTRACT)
+        .build(&t.child("first"));
+
+    ProjectBuilder::start()
+        .name("hello")
+        .version("0.1.0")
+        .manifest_extra(indoc! {r#"
+            [lib]
+            sierra = true
+
+            [[target.starknet-contract]]
+            build-external-contracts = ["first::*"]
+        "#})
+        .dep("first", Dep.path("../first"))
+        .dep_starknet()
+        .dep_cairo_test()
+        .build(&t.child("hello"));
+
+    Scarb::quick_snapbox()
+        .arg("build")
+        .arg("--test")
+        .current_dir(t.child("hello"))
+        .assert()
+        .success()
+        .stdout_matches(indoc! {r#"
+        [..]Compiling test(hello_unittest) hello v0.1.0 ([..]Scarb.toml)
+        [..]  Finished `dev` profile target(s) in [..]
+        "#});
+
+    assert_eq!(
+        t.child("hello/target/dev").files(),
+        vec![
+            "hello_unittest.test.json",
+            "hello_unittest.test.sierra.json",
+            "hello_unittest.test.starknet_artifacts.json",
+            "hello_unittest_HelloContract.test.contract_class.json"
+        ]
+    );
+
+    t.child("hello/target/dev/hello_unittest_HelloContract.test.contract_class.json")
+        .assert_is_json::<ContractClass>();
+
+    t.child("hello/target/dev/hello_unittest.test.starknet_artifacts.json")
+        .assert_is_json::<serde_json::Value>();
 }

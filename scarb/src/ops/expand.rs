@@ -31,6 +31,7 @@ pub enum ExpandEmitTarget {
 #[derive(Clone, Debug)]
 pub struct ExpandOpts {
     pub features: FeaturesOpts,
+    pub ignore_cairo_version: bool,
     pub target_kind: Option<TargetKind>,
     pub target_name: Option<SmolStr>,
     pub ugly: bool,
@@ -42,7 +43,8 @@ pub fn expand(package: Package, opts: ExpandOpts, ws: &Workspace<'_>) -> Result<
 
     let package_name = package.id.name.to_string();
     let resolve = ops::resolve_workspace(ws)?;
-    let compilation_units = ops::generate_compilation_units(&resolve, &opts.features, ws)?;
+    let compilation_units =
+        ops::generate_compilation_units(&resolve, &opts.features, opts.ignore_cairo_version, ws)?;
 
     // Compile procedural macros.
     compilation_units
@@ -160,9 +162,11 @@ fn do_expand(
     ws: &Workspace<'_>,
 ) -> Result<()> {
     let ScarbDatabase { db, .. } = build_scarb_root_database(compilation_unit, ws)?;
-    let main_crate_id = db.intern_crate(CrateLongId::Real(
-        compilation_unit.main_component().cairo_package_name(),
-    ));
+    let name = compilation_unit.main_component().cairo_package_name();
+    let main_crate_id = db.intern_crate(CrateLongId::Real {
+        name,
+        discriminator: compilation_unit.main_component().id.to_discriminator(),
+    });
     let mut compiler_config = build_compiler_config(&db, compilation_unit, &[main_crate_id], ws);
     // Report diagnostics, but do not fail.
     let _ = compiler_config.diagnostics_reporter.check(&db);
